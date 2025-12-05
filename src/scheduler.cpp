@@ -29,6 +29,7 @@ Scheduler::Scheduler()
     , hp_stream_(nullptr)
     , hp_task_running_(false)
     , current_hp_op_(nullptr)
+    , active_be_count_(0)
     , cumulative_be_duration_ms_(0.0f)
     , profile_table_(nullptr)
     , num_clients_(0) {
@@ -64,11 +65,12 @@ bool Scheduler::init(int num_clients, const SchedulerConfig& config) {
         return false;
     }
     
-    // 预分配 outstanding kernels 空间
+    // 预分配空间
     outstanding_kernels_.reserve(64);
+    threads_.reserve(num_clients);
     
     initialized_.store(true);
-    LOG_INFO("Scheduler initialized with %d clients", num_clients);
+    LOG_INFO("Scheduler initialized with %d clients (multi-threaded)", num_clients);
     LOG_INFO("  SM threshold: %d (%.1f%%)", 
              config_.get_sm_threshold(), config_.sm_threshold_ratio * 100);
     LOG_INFO("  Duration threshold: %.3f ms (%.1f%% of HP latency)", 
@@ -133,8 +135,12 @@ void Scheduler::start() {
     }
     
     running_.store(true);
-    thread_ = std::thread(&Scheduler::run, this);
-    LOG_INFO("Scheduler thread started");
+    
+    // 为每个客户端启动一个调度器线程
+    for (int i = 0; i < num_clients_; i++) {
+        threads_.emplace_back(&Scheduler::run_client, this, i);
+        LOG_INFO("Started scheduler thread for client %d", i);
+    }
 }
 
 void Scheduler::stop() {
@@ -143,89 +149,152 @@ void Scheduler::stop() {
     LOG_INFO("Stopping scheduler...");
     running_.store(false);
     
-    // 唤醒调度器
+    // 唤醒所有等待的线程
     g_capture_state.scheduler_cv.notify_all();
+    be_schedule_cv_.notify_all();
 }
 
 void Scheduler::join() {
-    if (thread_.joinable()) {
-        thread_.join();
-        LOG_INFO("Scheduler thread joined");
+    for (auto& t : threads_) {
+        if (t.joinable()) {
+            t.join();
+        }
     }
+    threads_.clear();
+    LOG_INFO("All scheduler threads joined");
 }
 
-void Scheduler::run() {
-    LOG_INFO("Scheduler main loop started");
+// ============================================================================
+// 每个客户端的调度器线程
+// ============================================================================
+
+void Scheduler::run_client(int client_idx) {
+    LOG_INFO("Scheduler thread for client %d started", client_idx);
+    
+    // 确定使用哪个 stream
+    cudaStream_t my_stream;
+    bool is_hp = (client_idx == 0);
+    
+    if (is_hp) {
+        my_stream = hp_stream_;
+    } else {
+        my_stream = be_streams_[client_idx - 1];
+    }
     
     while (running_.load()) {
-        bool has_work = false;
-        
-        // 处理所有客户端的队列
-        for (int i = 0; i < num_clients_; i++) {
-            if (!g_capture_state.client_queues[i]) continue;
-            
-            OperationPtr op = g_capture_state.client_queues[i]->try_pop();
-            if (op) {
-                // 为不同客户端分配不同的 stream
-                // client 0 = HP (高优先级), client 1+ = BE (低优先级)
-                cudaStream_t stream = (i == 0) ? hp_stream_ : be_streams_[i - 1];
-                
-                LOG_DEBUG("Scheduler: client %d op %lu type %d on stream %p", 
-                         i, op->op_id, (int)op->type, stream);
-                
-                cudaError_t err = execute_operation(op, stream);
-                LOG_DEBUG("Scheduler: op %lu executed with result %d", op->op_id, (int)err);
-                op->mark_completed(err);
-                has_work = true;
-                
-                if (i == 0) {
-                    stats_.hp_ops_scheduled++;
-                } else {
-                    stats_.be_ops_scheduled++;
-                }
-            }
+        // 从对应的客户端队列取操作
+        if (!g_capture_state.client_queues[client_idx]) {
+            std::this_thread::sleep_for(std::chrono::microseconds(100));
+            continue;
         }
         
-        // 如果没有工作，短暂等待
-        if (!has_work) {
+        OperationPtr op = g_capture_state.client_queues[client_idx]->try_pop();
+        
+        if (op) {
+            if (is_hp) {
+                // HP 操作：直接执行
+                LOG_DEBUG("HP thread: executing op %lu type %d", op->op_id, (int)op->type);
+                
+                hp_task_running_.store(true);
+                current_hp_op_ = op;
+                
+                cudaError_t err = execute_operation(op, my_stream);
+                op->mark_completed(err);
+                
+                hp_task_running_.store(false);
+                current_hp_op_ = nullptr;
+                
+                // HP 完成后，唤醒可能等待的 BE 线程
+                be_schedule_cv_.notify_all();
+                
+                {
+                    std::lock_guard<std::mutex> lock(stats_mutex_);
+                    stats_.hp_ops_scheduled++;
+                }
+            } else {
+                // BE 操作：可能需要等待调度许可
+                LOG_DEBUG("BE thread %d: checking schedule for op %lu", client_idx, op->op_id);
+                
+                // 调度决策
+                bool allowed = false;
+                {
+                    std::unique_lock<std::mutex> lock(be_schedule_mutex_);
+                    
+                    // 等待直到允许执行或停止
+                    be_schedule_cv_.wait(lock, [this, &op, &allowed]() {
+                        if (!running_.load()) return true;
+                        
+                        // 检查是否允许执行
+                        allowed = schedule_be(current_hp_op_, op);
+                        return allowed || !hp_task_running_.load();
+                    });
+                    
+                    if (!running_.load()) break;
+                    
+                    // 如果 HP 没在运行，也允许执行
+                    if (!hp_task_running_.load()) {
+                        allowed = true;
+                    }
+                }
+                
+                if (allowed) {
+                    LOG_DEBUG("BE thread %d: executing op %lu", client_idx, op->op_id);
+                    
+                    active_be_count_.fetch_add(1);
+                    cudaError_t err = execute_operation(op, my_stream);
+                    active_be_count_.fetch_sub(1);
+                    
+                    op->mark_completed(err);
+                    
+                    {
+                        std::lock_guard<std::mutex> lock(stats_mutex_);
+                        stats_.be_ops_scheduled++;
+                    }
+                } else {
+                    // 不允许执行，重新入队（简化处理：直接执行）
+                    LOG_DEBUG("BE thread %d: forced execute op %lu", client_idx, op->op_id);
+                    cudaError_t err = execute_operation(op, my_stream);
+                    op->mark_completed(err);
+                    
+                    {
+                        std::lock_guard<std::mutex> lock(stats_mutex_);
+                        stats_.be_ops_scheduled++;
+                    }
+                }
+            }
+        } else {
+            // 没有操作，等待
             std::unique_lock<std::mutex> lock(g_capture_state.scheduler_mutex);
             g_capture_state.scheduler_cv.wait_for(lock, 
                 std::chrono::microseconds(config_.poll_interval_us),
-                [this] {
+                [this, client_idx] {
                     if (!running_.load()) return true;
-                    // 检查任何客户端队列是否有操作
-                    for (int i = 0; i < num_clients_; i++) {
-                        if (g_capture_state.client_queues[i] && 
-                            !g_capture_state.client_queues[i]->empty()) {
-                            return true;
-                        }
-                    }
-                    return false;
+                    return g_capture_state.client_queues[client_idx] && 
+                           !g_capture_state.client_queues[client_idx]->empty();
                 });
         }
     }
     
-    LOG_INFO("Scheduler main loop ended");
+    LOG_INFO("Scheduler thread for client %d ending", client_idx);
     
     // 处理剩余操作
-    LOG_INFO("Processing remaining operations...");
-    for (int i = 0; i < num_clients_; i++) {
-        while (g_capture_state.client_queues[i] && 
-               !g_capture_state.client_queues[i]->empty()) {
-            auto op = g_capture_state.client_queues[i]->try_pop();
-            if (op) {
-                cudaStream_t stream = (i == 0) ? hp_stream_ : be_streams_[i - 1];
-                cudaError_t err = execute_operation(op, stream);
-                op->mark_completed(err);
-            }
+    while (g_capture_state.client_queues[client_idx] && 
+           !g_capture_state.client_queues[client_idx]->empty()) {
+        auto op = g_capture_state.client_queues[client_idx]->try_pop();
+        if (op) {
+            cudaError_t err = execute_operation(op, my_stream);
+            op->mark_completed(err);
         }
     }
     
-    // 等待所有 stream 完成
-    cudaStreamSynchronize(hp_stream_);
-    for (auto& stream : be_streams_) {
-        cudaStreamSynchronize(stream);
-    }
+    // 等待 stream 完成
+    cudaStreamSynchronize(my_stream);
+}
+
+// 保留原有的 run() 函数作为备用（单线程模式）
+void Scheduler::run() {
+    // 多线程模式下不使用此函数
+    LOG_WARN("Single-threaded run() called in multi-threaded scheduler");
 }
 
 bool Scheduler::schedule_be(const OperationPtr& hp_op, const OperationPtr& be_op) {
@@ -234,16 +303,15 @@ bool Scheduler::schedule_be(const OperationPtr& hp_op, const OperationPtr& be_op
         return true;
     }
     
-    // 如果不启用干扰感知，默认拒绝
+    // 如果不启用干扰感知，允许并发（依赖 stream 优先级）
     if (!config_.interference_aware) {
-        return false;
+        return true;
     }
     
     // 检查 BE 操作的 SM 需求
-    int sm_needed = be_op->sm_needed;
+    int sm_needed = be_op ? be_op->sm_needed : 0;
     if (sm_needed <= 0) {
-        // 没有 profile 信息，使用默认值
-        sm_needed = config_.num_sms / 4;  // 假设占用 25%
+        sm_needed = config_.num_sms / 4;  // 默认 25%
     }
     
     if (sm_needed >= config_.get_sm_threshold()) {
@@ -254,7 +322,7 @@ bool Scheduler::schedule_be(const OperationPtr& hp_op, const OperationPtr& be_op
     
     // 检查 profile 类型是否互补
     ProfileType hp_type = hp_op ? hp_op->profile_type : ProfileType::UNKNOWN;
-    ProfileType be_type = be_op->profile_type;
+    ProfileType be_type = be_op ? be_op->profile_type : ProfileType::UNKNOWN;
     
     if (!is_complementary(hp_type, be_type)) {
         LOG_TRACE("BE op rejected: profiles not complementary");
@@ -262,15 +330,21 @@ bool Scheduler::schedule_be(const OperationPtr& hp_op, const OperationPtr& be_op
     }
     
     // 检查累计 BE 时间是否超过阈值
-    float be_duration = be_op->estimated_duration_ms;
+    float be_duration = be_op ? be_op->estimated_duration_ms : 0.1f;
     if (be_duration <= 0) {
-        be_duration = 0.1f;  // 默认 0.1ms
+        be_duration = 0.1f;
     }
     
-    if (cumulative_be_duration_ms_ + be_duration > config_.get_dur_threshold_ms()) {
-        LOG_TRACE("BE op rejected: cumulative duration %.3f + %.3f > threshold %.3f",
-                  cumulative_be_duration_ms_, be_duration, config_.get_dur_threshold_ms());
-        return false;
+    {
+        std::lock_guard<std::mutex> lock(cumulative_mutex_);
+        if (cumulative_be_duration_ms_ + be_duration > config_.get_dur_threshold_ms()) {
+            LOG_TRACE("BE op rejected: cumulative duration %.3f + %.3f > threshold %.3f",
+                      cumulative_be_duration_ms_, be_duration, config_.get_dur_threshold_ms());
+            return false;
+        }
+        
+        // 更新累计时间
+        cumulative_be_duration_ms_ += be_duration;
     }
     
     return true;
@@ -288,120 +362,42 @@ bool Scheduler::is_complementary(ProfileType hp_type, ProfileType be_type) {
 }
 
 void Scheduler::process_hp_operation(OperationPtr op) {
-    LOG_TRACE("Processing HP op %lu type %s", op->op_id, op_type_name(op->type));
-    
-    hp_task_running_.store(true);
-    current_hp_op_ = op;
-    
-    // 执行操作
-    cudaError_t err = execute_operation(op, hp_stream_);
-    
-    // 对于同步操作，等待 stream 完成
-    if (op->type == OperationType::DEVICE_SYNC ||
-        op->type == OperationType::STREAM_SYNC ||
-        op->type == OperationType::MEMCPY ||
-        op->type == OperationType::MALLOC ||
-        op->type == OperationType::FREE) {
-        cudaStreamSynchronize(hp_stream_);
-    }
-    
-    hp_task_running_.store(false);
-    current_hp_op_ = nullptr;
-    
-    // 重置 BE 累计时间
-    cumulative_be_duration_ms_ = 0.0f;
-    
-    // 标记完成
-    op->mark_completed(err);
-    stats_.hp_ops_scheduled++;
-    
-    LOG_TRACE("HP op %lu completed with result %d", op->op_id, (int)err);
+    // 多线程模式下由 run_client() 处理
 }
 
 void Scheduler::process_be_operation(OperationPtr op) {
-    LOG_TRACE("Processing BE op %lu type %s from client %d", 
-              op->op_id, op_type_name(op->type), op->client_idx);
-    
-    int be_idx = op->client_idx - 1;
-    if (be_idx < 0 || be_idx >= (int)be_streams_.size()) {
-        LOG_ERROR("Invalid BE client index: %d", op->client_idx);
-        op->mark_completed(cudaErrorInvalidValue);
-        return;
-    }
-    
-    cudaStream_t stream = be_streams_[be_idx];
-    
-    // 创建事件用于跟踪
-    OutstandingKernel outstanding;
-    outstanding.op = op;
-    outstanding.estimated_duration_ms = op->estimated_duration_ms;
-    outstanding.submit_time = std::chrono::steady_clock::now();
-    
-    cudaEventCreate(&outstanding.start_event);
-    cudaEventCreate(&outstanding.end_event);
-    
-    // 记录开始事件
-    cudaEventRecord(outstanding.start_event, stream);
-    
-    // 执行操作
-    cudaError_t err = execute_operation(op, stream);
-    
-    // 记录结束事件
-    cudaEventRecord(outstanding.end_event, stream);
-    
-    // 添加到 outstanding 列表
-    outstanding_kernels_.push_back(outstanding);
-    
-    // 更新累计时间
-    cumulative_be_duration_ms_ += op->estimated_duration_ms > 0 ? 
-                                   op->estimated_duration_ms : 0.1f;
-    
-    // 对于同步操作，立即等待完成
-    if (op->type == OperationType::DEVICE_SYNC ||
-        op->type == OperationType::STREAM_SYNC ||
-        op->type == OperationType::MEMCPY ||
-        op->type == OperationType::MALLOC ||
-        op->type == OperationType::FREE) {
-        cudaStreamSynchronize(stream);
-        op->mark_completed(err);
-    } else {
-        // 异步操作，稍后检查完成
-        op->result = err;
-    }
-    
-    stats_.be_ops_scheduled++;
+    // 多线程模式下由 run_client() 处理
 }
 
 void Scheduler::check_outstanding_kernels() {
+    std::lock_guard<std::mutex> lock(outstanding_mutex_);
+    
     auto it = outstanding_kernels_.begin();
     while (it != outstanding_kernels_.end()) {
         cudaError_t status = cudaEventQuery(it->end_event);
         
         if (status == cudaSuccess) {
-            // Kernel 已完成
             float elapsed_ms = 0;
             cudaEventElapsedTime(&elapsed_ms, it->start_event, it->end_event);
             
             // 从累计时间中减去
-            cumulative_be_duration_ms_ -= it->estimated_duration_ms > 0 ? 
-                                          it->estimated_duration_ms : 0.1f;
-            cumulative_be_duration_ms_ = std::max(0.0f, cumulative_be_duration_ms_);
+            float est = it->estimated_duration_ms > 0 ? it->estimated_duration_ms : 0.1f;
+            {
+                std::lock_guard<std::mutex> lock(cumulative_mutex_);
+                cumulative_be_duration_ms_ = std::max(0.0f, cumulative_be_duration_ms_ - est);
+            }
             
-            // 标记完成
             if (it->op && !it->op->completed.load()) {
                 it->op->mark_completed(it->op->result);
             }
             
-            // 销毁事件
             cudaEventDestroy(it->start_event);
             cudaEventDestroy(it->end_event);
             
             it = outstanding_kernels_.erase(it);
         } else if (status == cudaErrorNotReady) {
-            // 还在执行
             ++it;
         } else {
-            // 错误
             LOG_ERROR("Event query error: %s", cudaGetErrorString(status));
             if (it->op && !it->op->completed.load()) {
                 it->op->mark_completed(status);
@@ -418,7 +414,6 @@ cudaError_t Scheduler::execute_operation(OperationPtr op, cudaStream_t stream) {
     
     LOG_DEBUG("Executing op %lu type %d on stream %p", op->op_id, (int)op->type, stream);
     
-    // 根据操作类型调用相应的执行函数，传递调度器分配的 stream
     switch (op->type) {
         case OperationType::KERNEL_LAUNCH:
         case OperationType::MALLOC:
@@ -454,13 +449,11 @@ cudaError_t Scheduler::execute_operation(OperationPtr op, cudaStream_t stream) {
 // ============================================================================
 
 bool start_scheduler(int num_clients, const SchedulerConfig& config) {
-    // 先初始化拦截层
     if (init_capture_layer(num_clients) != 0) {
         LOG_ERROR("Failed to initialize capture layer");
         return false;
     }
     
-    // 初始化并启动调度器
     if (!g_scheduler.init(num_clients, config)) {
         LOG_ERROR("Failed to initialize scheduler");
         return false;
@@ -494,8 +487,7 @@ void orion_stop_scheduler() {
 }
 
 void orion_set_hp_latency(float latency_ms) {
-    // 需要在启动前设置，这里简化处理
-    // 实际应该通过配置接口
+    // 需要在启动前设置
 }
 
 } // extern "C"

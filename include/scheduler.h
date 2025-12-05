@@ -128,10 +128,14 @@ private:
     void destroy_streams();
     
 private:
+    // 每个客户端的调度器线程函数
+    void run_client(int client_idx);
+    
+private:
     SchedulerConfig config_;
     
-    // 调度器线程
-    std::thread thread_;
+    // 调度器线程 - 每个客户端一个
+    std::vector<std::thread> threads_;
     std::atomic<bool> running_;
     std::atomic<bool> initialized_;
     
@@ -142,19 +146,27 @@ private:
     // 当前状态
     std::atomic<bool> hp_task_running_;         // 是否有 HP 任务在执行
     OperationPtr current_hp_op_;                // 当前 HP 操作
+    std::atomic<int> active_be_count_;          // 当前活跃的 BE 操作数
     
     // Outstanding BE kernels
     std::vector<OutstandingKernel> outstanding_kernels_;
+    std::mutex outstanding_mutex_;              // 保护 outstanding_kernels_
     float cumulative_be_duration_ms_;           // 累计 BE kernel 时间
+    std::mutex cumulative_mutex_;               // 保护累计时间
     
     // Profile 表
     KernelProfileTable* profile_table_;
     
     // 统计
     Stats stats_;
+    std::mutex stats_mutex_;                    // 保护统计数据
     
     // Client 数量
     int num_clients_;
+    
+    // BE 调度控制
+    std::mutex be_schedule_mutex_;              // BE 调度决策锁
+    std::condition_variable be_schedule_cv_;    // BE 等待条件变量
 };
 
 // ============================================================================
